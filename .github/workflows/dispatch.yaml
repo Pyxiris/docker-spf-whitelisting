@@ -1,0 +1,34 @@
+name: dispatch
+permissions: {}
+
+on:
+  issue_comment:
+    types: [created]
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate token
+        id: generate_token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.PYXIRIS_APP_ID }}
+          private-key: ${{ secrets.PYXIRIS_APP_SECRET }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Dispatch workflow
+        uses: peter-evans/slash-command-dispatch@v4
+        with:
+          token: ${{ steps.generate_token.outputs.token }}
+          reactions: false
+          # Note peter-evans/slash-command-dispatch provides the ability to change event-type-suffix
+          # from its default of "-command", but you should not do that here as it is hardcoded into this project
+          config: >
+            [
+              {
+                "command": "build-push",
+                "permission": "maintain",
+                "issue_type": "pull-request"
+              }
+            ]

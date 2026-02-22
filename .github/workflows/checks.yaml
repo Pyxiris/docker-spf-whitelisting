@@ -1,0 +1,291 @@
+name: Checks Handler
+permissions: {} # Default to zero permissions as per github actions best practices
+
+on:
+  # If we use pull_request here, then we will have no access to secrets which means
+  # that we will be unable to generate tokens. Also, the github token will not have any
+  # permission to write checks. Using pull_request_target gives us access to secrets.
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+  workflow_run:
+    # List the wokflows you need update checks for here. Unfortunately, I don't think there's a way to automate this
+    # You could, of course, define just the workflows that you would NOT like to trigger this workflow, but
+    # I have not tested this and it would still require manual updating if you added workflows that trigger on
+    # pull_request that get their own automatic checks (with no secrets).
+    workflows:
+      - "Build and Push Docker Image"
+    types:
+      - completed # Only update checks on completion.
+      # - in_progress # You could add this + some logic to update checks to in progress state on start
+
+jobs:
+  setup-checks:
+    # This job name will show up as a check name because it runs on pull_request_target.
+    # Unfortunately, having this rather useless "check" is unavoidable as far as I can tell.
+    # I have compacted all the checks hanling into one job specifically so that it would only show up as a single check
+    name: Setup Checks
+    runs-on: ubuntu-latest
+    permissions:
+      checks: write
+      contents: read
+      pull-requests: read
+      actions: read
+
+    # This step looks trough all workflow files and finds jobs that begin with _isCheck_
+    # It runs for both pull_request_target and workflow_run events.
+    steps:
+      # First we have to get the workflow files
+      - name: Get Workflow files
+        uses: actions/checkout@v5
+        with:
+          sparse-checkout: | # We avoid checking out the entire repository
+            .github/workflows
+
+      - name: Identify Slash Command Checks
+        id: get_check_jobs
+        run: |
+           all_workflow_checks="{}" # This will store the final JSON output
+           workflow_dir="${{ github.workspace }}/.github/workflows"
+           check_job_prefix="_isCheck_" # This is the prefix that identifies a job as a check
+
+           for file in "$workflow_dir"/*.yml "$workflow_dir"/*.yaml; do
+             if [ ! -f "$file" ]; then continue; fi
+
+             workflow_name=$(yq '.name' "$file")
+             if [ -z "$workflow_name" ] || [ "$workflow_name" == "null" ]; then
+               echo "::warning file=$file::Workflow file has no 'name' property. Skipping."
+               continue
+             fi
+
+             check_job_ids=$(yq '(.jobs | keys)[]' "$file" | grep -E "^${check_job_prefix}" || true)
+             dispatch_type=$(yq '.on.repository_dispatch.types[0]' "$file")
+
+             if [ -n "$check_job_ids" ]; then
+               command="" # Default to empty for non-slash-command workflows
+               if [ -n "$dispatch_type" ] && [ "$dispatch_type" != "null" ]; then
+                 # This is a slash-command workflow, extract the command.
+                 # Use shell parameter expansion to remove the '-command' suffix.
+                 command=${dispatch_type%-command}
+               fi
+
+               workflow_checks_array="[]" # Array to hold checks for the current workflow
+               for job_id in $check_job_ids; do
+                 check_job_name=$(yq -o=json "$file" | jq --arg id "$job_id" -r '.jobs[$id].name // $id')
+                 workflow_checks_array=$(echo "$workflow_checks_array" | jq --arg job_id "$job_id" --arg check_name "$check_job_name" '. + [{"job_id": $job_id, "check_name": $check_name}]')
+               done
+
+               workflow_object=$(jq -n --arg cmd "$command" --argjson checks_array "$workflow_checks_array" '{"command": $cmd, "checks": $checks_array}')
+               all_workflow_checks=$(echo "$all_workflow_checks" | jq --arg wf_name "$workflow_name" --argjson wf_obj "$workflow_object" '. + {($wf_name): $wf_obj}')
+             fi
+           done
+
+           echo "check_jobs=$(echo "$all_workflow_checks" | jq -c .)" >> $GITHUB_OUTPUT
+        # If use the default token all the checs are in the same group.
+        # If you uncomment this step and toggle the lines below with github-token: ${{ steps.generate_token.outputs.token }}
+        # your generated checks will be in their own section under the name of your Github App
+      # - name: Generate token
+      #   id: generate_token
+      #   uses: actions/create-github-app-token@v2
+      #   with:
+      #     app-id: ${{ vars.PYXIRIS_APP_ID }}
+      #     private-key: ${{ secrets.PYXIRIS_APP_SECRET }}
+      #     owner: ${{ github.repository_owner }}
+
+      # The following steps run only for pull request events to create the initial pending checks.
+      - name: Create Pending Status Checks
+        if: github.event_name == 'pull_request_target'
+        uses: actions/github-script@v7
+        with:
+          # Toggle if using app token
+          # github-token: ${{ steps.generate_token.outputs.token }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+             const allCheckJobs = JSON.parse('${{ steps.get_check_jobs.outputs.check_jobs }}');
+             if (Object.keys(allCheckJobs).length === 0) {
+               console.log('No _isCheck_ jobs  found.');
+               return;
+             }
+
+             // this runs on pull_request_target, so it uses the direct context.
+             const sha = "${{ github.event.pull_request.head.sha }}";
+             const pr_number = context.payload.pull_request.number;
+
+             for (const workflowName in allCheckJobs) { // e.g., "Build"
+               const workflowData = allCheckJobs[workflowName]; // e.g., { "command": "build", "checks": [...] }
+               const command = workflowData.command;
+               const checksInWorkflow = workflowData.checks;
+               const isSlashCommand = command && command.length > 0;
+
+               for (const check of checksInWorkflow) { // Iterate through each check defined in the workflow
+                 // Create a unique external_id rather than rely on the display name to reliably find this check later.
+                 // TODO: We could add the sha in here and use it to prevent a check from an old commit from updating
+                 // a check run from a newer commit, but I am not sure how that would behave. Anyways, I have sha checking
+                 // set up independantly further down, so we are already protected against this.
+                 const external_id = `custom_check:${workflowName}:${check.job_id}:${pr_number}`;
+
+                 await github.rest.checks.create({
+                   owner: context.repo.owner,
+                   repo: context.repo.repo,
+                   name: check.check_name, // Use the specific check's display name
+                   head_sha: sha,
+                   status: 'queued',
+                   external_id: external_id,
+                   output: {
+                     title: isSlashCommand ? 'Awaiting Slash Command' : 'Automatic Check',
+                     summary: isSlashCommand
+                       ? `This check is awaiting a slash command to be triggered.`
+                       : 'This check will run automatically based on code changes.',
+                     text: isSlashCommand
+                       ? `To run this check, comment \`/${command}\` + any required args on the pull request.`
+                       : 'Results will be reported here upon completion.'
+                   }
+                 });
+               }
+             }
+
+      # The following steps run only after a slash command workflow completes, to update the final check status.
+      - name: Download client_payload artifact
+        if: github.event_name == 'workflow_run'
+        id: download_artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: client-payload
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: true # Continue to allow graceful skipping if artifact is not found
+
+      - name: Update Checks from Workflow Run
+        if: github.event_name == 'workflow_run' && steps.download_artifact.outcome == 'success'
+        uses: actions/github-script@v7
+        with:
+          # Toggle if using app token
+          # github-token: ${{ steps.generate_token.outputs.token }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+
+            // Get PR info from the downloaded payload
+            if (!fs.existsSync('client_payload.json')) {
+              core.info('client_payload.json not found. Skipping.');
+              return;
+            }
+
+            const payload = JSON.parse(fs.readFileSync('client_payload.json', 'utf8'));
+            const payload_sha = payload.pull_request.head.sha;
+            const payload_pr_number = payload.pull_request.number;
+
+            if (!payload_pr_number) {
+              core.info('Could not determine PR number. Skipping.');
+              return;
+            }
+
+            // Verify the PR hasn't been updated with new commits
+            const { data: current_pr } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: payload_pr_number,
+            });
+            const current_head_sha = current_pr.head.sha;
+
+            if (payload_sha !== current_head_sha) {
+              core.info('PR has been updated since the workflow was triggered. The check status will not be updated.');
+              core.info(`SHA of workflow run: ${payload_sha}`);
+              core.info(`Current head SHA: ${current_head_sha}`);
+              return;
+            }
+
+            // Find and update the corresponding check run
+             const triggeredWorkflowName = context.payload.workflow_run.name;
+             core.info(`Triggered by workflow: ${triggeredWorkflowName}`);
+
+             const allCheckJobs = JSON.parse('${{ steps.get_check_jobs.outputs.check_jobs }}'); // e.g., {"Build": {"command": "build", "checks": [...]}}
+             core.info(`All identified check jobs: ${JSON.stringify(allCheckJobs, null, 2)}`);
+
+             const workflowData = allCheckJobs[triggeredWorkflowName];
+
+             if (!workflowData || !workflowData.checks || workflowData.checks.length === 0) {
+               core.info(`Workflow "${triggeredWorkflowName}" does not contain any jobs prefixed with '_isCheck_'. Skipping.`);
+               return;
+             }
+             core.info(`Found data for this workflow: ${JSON.stringify(workflowData, null, 2)}`);
+
+             const run_id = context.payload.workflow_run.id;
+             core.info(`Workflow run ID: ${run_id}`);
+
+             core.info(`Operating on SHA: ${payload_sha}`);
+             core.info(`Operating on PR Number: ${payload_pr_number}`);
+
+             // Fetch all existing check runs for this commit to find the one we need to update.
+             const { data: { check_runs: existing_checks } } = await github.rest.checks.listForRef({
+               owner: context.repo.owner,
+               repo: context.repo.repo,
+               ref: payload_sha,
+             });
+             core.info(`Found ${existing_checks.length} existing checks for SHA ${payload_sha}.`);
+
+             // Fetch all jobs for the completed workflow run to get individual job conclusions and URLs
+             const { data: { jobs: completedJobs } } = await github.rest.actions.listJobsForWorkflowRun({
+               owner: context.repo.owner,
+               repo: context.repo.repo,
+               run_id: run_id
+             });
+             core.info(`Found ${completedJobs.length} completed jobs in the workflow run.`);
+             core.info(`Completed jobs: ${JSON.stringify(completedJobs.map(j => ({name: j.name, conclusion: j.conclusion})), null, 2)}`);
+
+             for (const expectedCheck of workflowData.checks) { // Iterate through each expected check
+               core.info(`\nProcessing expected check: ${JSON.stringify(expectedCheck, null, 2)}`);
+
+               // Construct the same unique external_id to find the check we created.
+               const external_id = `custom_check:${triggeredWorkflowName}:${expectedCheck.job_id}:${payload_pr_number}`;
+
+               const checkToUpdate = existing_checks.find(cr => cr.external_id === external_id);
+
+               if (!checkToUpdate) {
+                 core.warning(`Could not find a pre-existing check run with external_id "${external_id}" to update.`);
+                 continue;
+               }
+               core.info(`Found existing check run "${checkToUpdate.name}" with ID ${checkToUpdate.id} via external_id.`);
+
+               const matchingCompletedJob = completedJobs.find(job => job.name === expectedCheck.check_name);
+
+               if (matchingCompletedJob) {
+                 core.info(`Found matching completed job: ${matchingCompletedJob.name}`);
+                 const job_run_id = matchingCompletedJob.id;
+                 core.info(`Found matching job with integer ID: ${job_run_id}`);
+                 const jobConclusion = matchingCompletedJob.conclusion;
+                 core.info(`Job conclusion: ${jobConclusion}`);
+                 const details_url = `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${run_id}/job/${job_run_id}?pr=${payload_pr_number}`;
+                 core.info(`Constructed Job URL: ${details_url}`);
+
+                 const checkUpdatePayload = {
+                   owner: context.repo.owner,
+                   repo: context.repo.repo,
+                   check_run_id: checkToUpdate.id,
+                   status: 'completed',
+                   conclusion: jobConclusion,
+                   output: {
+                     title: `Job run ${jobConclusion}`,
+                     summary: `The "${expectedCheck.check_name}" job in workflow "${triggeredWorkflowName}" finished with status: ${jobConclusion}.\n\n[Click to see job run logs](${details_url})`,
+
+                   },
+                   details_url: details_url // This only works when using a Github App token for some reason and is kinda pointless anyways
+                 };
+
+                 core.info(`Updating check with payload: ${JSON.stringify(checkUpdatePayload, null, 2)}`);
+                 await github.rest.checks.update(checkUpdatePayload);
+                 core.info(`Successfully updated check: ${expectedCheck.check_name}`);
+               } else {
+                 core.warning(`Could not find a completed job matching check "${expectedCheck.check_name}" in workflow run ${run_id}. Updating check to 'skipped'.`);
+                 await github.rest.checks.update({
+                   owner: context.repo.owner,
+                   repo: context.repo.repo,
+                   check_run_id: checkToUpdate.id,
+                   status: 'completed',
+                   conclusion: 'skipped',
+                   output: {
+                     title: 'Job Skipped',
+                     summary: `The job for this check was not found in the completed workflow, it may have been skipped.`
+                   }
+                 });
+               }
+             }
