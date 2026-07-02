@@ -7,6 +7,9 @@ on:
       - "v*.*.*"
   repository_dispatch:
     types: [build-push-command]
+  schedule:
+    # Thursdays at 06:40 EST (11:40 UTC)
+    - cron: "40 11 * * 4"
 
 jobs:
   upload_client_payload:
@@ -30,6 +33,7 @@ jobs:
     runs-on: ubuntu-latest
     if: |
       github.event_name == 'push' ||
+      github.event_name == 'schedule' ||
       github.event_name == 'repository_dispatch' &&
       github.event.client_payload.slash_command.args.named.sha != '' &&
       startsWith(
@@ -43,11 +47,31 @@ jobs:
       tag: ${{ steps.meta.outputs.tags }}
       job_id: ${{ job.check_run_id }}
     steps:
+      - name: Resolve latest release tag
+        id: latest_release
+        if: github.event_name == 'schedule'
+        run: |
+          repo="https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+          latest_tag=$(
+            git ls-remote --tags --refs "$repo" 'v*.*.*' \
+            | awk '{print $2}' \
+            | sed 's|refs/tags/||' \
+            | sort -V \
+            | tail -n1
+          )
+          if [ -z "$latest_tag" ]; then
+            echo "No release tag matching v*.*.* found" >&2
+            exit 1
+          fi
+          echo "Building latest from release tag: $latest_tag"
+          echo "ref=refs/tags/${latest_tag}" >> "$GITHUB_OUTPUT"
+          echo "tag=${latest_tag}" >> "$GITHUB_OUTPUT"
+
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
-          ref: ${{ github.event.client_payload.pull_request.head.sha || github.ref }}
+          ref: ${{ steps.latest_release.outputs.ref || github.event.client_payload.pull_request.head.sha || github.ref }}
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
@@ -70,7 +94,8 @@ jobs:
           tags: |
             # For git tag events create a single tag with the same name (e.g. 'v1.2.3') and 'latest'
             type=raw,value=${{ github.ref_name }},enable=${{ github.ref_type == 'tag' }}
-            type=raw,value=latest,enable=${{ github.ref_type == 'tag' }}
+            type=raw,value=${{ steps.latest_release.outputs.tag }},enable=${{ github.event_name == 'schedule' }}
+            type=raw,value=latest,enable=${{ github.ref_type == 'tag' || github.event_name == 'schedule' }}
 
             # For pull requests, create a single tag with the PR number prefixed by 'pr-' (e.g. pr-123')
             type=raw,value=pr-${{ github.event.client_payload.pull_request.number }},enable=${{ github.event_name == 'repository_dispatch' }}
